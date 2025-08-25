@@ -1,0 +1,12 @@
+log_level: "INFO"
+
+inverter:
+    address: "/dev/ttyUSB0"
+    baudrate: 9600
+
+mqtt:
+    user: "user"
+    password: "password"
+    broker_uri: "ssl://mqtt.example.com:8883"
+    client_id: "go-growatt"
+    topic: "monitoring/solar"
