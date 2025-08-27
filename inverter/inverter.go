@@ -97,6 +97,9 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 	// known yet.
 	lastInverterState := InverterStateCodes[0]
 
+	var IsTimeoutError bool
+	timeoutCnt := 0
+
 	slog.Info("Start reading from inverter")
 
 	statsTicker := time.NewTicker(2 * time.Second)
@@ -109,7 +112,13 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 		case <-statsTicker.C:
 			stats, err := i.getStats()
 			if err != nil {
-				if lastInverterState == InverterStateCodes[0] && err.Error() == "request timed out" {
+				if err.Error() == "request timed out" {
+					IsTimeoutError = true
+				} else {
+					IsTimeoutError = false
+				}
+
+				if lastInverterState == InverterStateCodes[0] && IsTimeoutError {
 					// Inverter is in 'waiting state' and modbus registers
 					// can only be read when the status is changed to 'normal'.
 					slog.Debug(
@@ -120,11 +129,21 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 					time.Sleep(1 * time.Minute)
 				} else {
 					slog.Warn(fmt.Sprintf("Got error while retrieving modbus registers: %v", err))
+					if IsTimeoutError {
+						timeoutCnt += 1
+
+						if timeoutCnt > 10 {
+							slog.Warn(fmt.Sprintf("Got %d subsequent read timeouts. Reconnect to inverter.", timeoutCnt))
+							i.Disconnect()
+							i.Connect()
+						}
+					}
 				}
 				continue
 			}
 			ch <- stats
 			lastInverterState = stats.State
+			timeoutCnt = 0
 
 		case <-checkTimeTicker.C:
 			if err := i.CheckSetTime(); err != nil {
