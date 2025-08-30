@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build, test, release:
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
