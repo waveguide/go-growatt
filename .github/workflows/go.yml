@@ -2,9 +2,8 @@ name: Go
 
 on:
   push:
-    branches: [ "github-releases" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
