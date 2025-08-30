@@ -132,7 +132,7 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 					if IsTimeoutError {
 						timeoutCnt += 1
 
-						if timeoutCnt > 10 {
+						if timeoutCnt >= 10 {
 							slog.Warn(fmt.Sprintf("Got %d subsequent read timeouts. Reconnect to inverter.", timeoutCnt))
 							i.Disconnect()
 							i.Connect()
@@ -146,9 +146,12 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 			timeoutCnt = 0
 
 		case <-checkTimeTicker.C:
-			if err := i.CheckSetTime(); err != nil {
-				slog.Error(fmt.Sprintf("CheckSetTime on inverter failed: %v", err))
-				continue
+			// Only try to check and set time when inverter is in 'normal' state
+			if lastInverterState == InverterStateCodes[1] {
+				if err := i.CheckSetTime(); err != nil {
+					slog.Error(fmt.Sprintf("CheckSetTime on inverter failed: %v", err))
+					continue
+				}
 			}
 
 		case <-ctx.Done():
