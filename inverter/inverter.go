@@ -49,12 +49,17 @@ type Stats struct {
 	TotalWorkTimeSecs uint32 `json:"total_worktime_secs"` // Total work time seconds
 	Temperature       uint16 `json:"inverter_temp"`       // Inverter temperature in Celcius
 	FaultCode         uint16 `json:"fault_code"`          // Used when the inverter has a fault
+	ActivePowerRate   uint16 `json:"active_power_rate"`   // Configured AC output limit as a percentage (0-100)
 }
 
 type Inverter struct {
 	Address  string
 	BaudRate int
 	client   *modbus.ModbusClient
+
+	// activePowerRate caches the last known active power rate (holding
+	// register 3) so a transient read failure doesn't drop it from the stats.
+	activePowerRate uint16
 }
 
 func (i *Inverter) connect() error {
@@ -226,7 +231,19 @@ func (i *Inverter) getStats() (Stats, error) {
 		return Stats{}, fmt.Errorf("failed to read registers 0-41: %w", err)
 	}
 
-	return parseStats(data, time.Now().UTC().Format("2006-01-02 15:04:05")), nil
+	stats := parseStats(data, time.Now().UTC().Format("2006-01-02 15:04:05"))
+
+	// Read the configured power rate (holding register 3) and include it. On a
+	// transient failure keep the last known value rather than failing the whole
+	// stats read.
+	if rate, err := i.getActivePowerRate(); err != nil {
+		slog.Warn(fmt.Sprintf("Failed to read active power rate: %v", err))
+	} else {
+		i.activePowerRate = rate
+	}
+	stats.ActivePowerRate = i.activePowerRate
+
+	return stats, nil
 }
 
 // parseStats decodes a block of 41 input registers (starting at register 0)
@@ -416,6 +433,19 @@ func (i *Inverter) setActivePowerRate(percentage uint16) error {
 			percentage, err,
 		)
 	}
+	i.activePowerRate = percentage
 
 	return nil
+}
+
+// getActivePowerRate reads the currently configured active power rate (the same
+// holding register that setActivePowerRate writes to). The value is a
+// percentage of the inverter's maximum AC output (0-100).
+func (i *Inverter) getActivePowerRate() (uint16, error) {
+	data, err := i.client.ReadRegisters(3, 1, modbus.HOLDING_REGISTER)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read active power percentage: %w", err)
+	}
+
+	return data[0], nil
 }
