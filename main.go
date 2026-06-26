@@ -8,6 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,8 +51,8 @@ func main() {
 	}
 	slog.Info("Starting")
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	stopSigs := make(chan os.Signal, 1)
+	signal.Notify(stopSigs, os.Interrupt, syscall.SIGTERM)
 
 	// Connect to MQTT broker
 	mqttClient := mqtt.Mqtt{
@@ -64,27 +67,53 @@ func main() {
 	}
 	defer mqttClient.Disconnect()
 
+	// Channel carrying power-rate commands from MQTT into the reader goroutine.
+	// Buffered with 'latest wins' semantics so a slow reader never blocks paho's
+	// callback and only the most recent command is applied.
+	// Example publishing a message: mosquitto_pub -t 'solar/powerrate/set' -m '50'
+	powerRateChan := make(chan uint16, 1)
+
+	cmdTopic := fmt.Sprintf("%s/powerrate/set", cfg.Mqtt.Topic)
+	if err := mqttClient.Subscribe(cmdTopic, func(payload string) {
+		rate, err := strconv.Atoi(strings.TrimSpace(payload))
+		if err != nil || rate < 0 || rate > 100 {
+			slog.Warn(fmt.Sprintf("Ignoring invalid power rate command %q on %s", payload, cmdTopic))
+			return
+		}
+
+		// Latest wins: discard any stale pending command, then enqueue this one.
+		select {
+		case <-powerRateChan: // if a value is buffered, remove it
+		default:
+		}
+		powerRateChan <- uint16(rate)
+	}); err != nil {
+		log.Fatal("Failed to subscribe to power rate command topic")
+	}
+
 	// Connect to inverter
 	inv := inverter.Inverter{
 		Address:  cfg.Inverter.Address,
 		BaudRate: cfg.Inverter.BaudRate,
 	}
-	if err := inv.Connect(); err != nil {
-		log.Fatal("Failed to connect to inverter")
-	}
-	defer inv.Disconnect()
-
-	// Upon start always check (and set when needed) time on inverter
-	if err := inv.CheckSetTime(); err != nil {
-		// Log error and continue
-		slog.Warn(fmt.Sprintf("Failed to CheckSetTime on inverter upon start: %v", err))
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+
+	// inv.Run owns the inverter connection: it connects on start and
+	// disconnects when it returns. Cancel the context and wait for that
+	// goroutine to fully stop before main returns.
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 
 	dataChan := make(chan inverter.Stats)
-	go inv.Read(ctx, dataChan)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		inv.Run(ctx, dataChan, powerRateChan)
+	}()
 
 	lastInverterState := inverter.InverterStateCodes[0]
 	for {
@@ -138,7 +167,7 @@ func main() {
 				true,
 			)
 
-		case sig := <-sigs:
+		case sig := <-stopSigs:
 			slog.Info(fmt.Sprintf("Stopping! Got signal %v", sig))
 			return
 		}
@@ -154,7 +183,7 @@ func readConfig(configPath string) (config, error) {
 	}
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("Error parsing YAML: %v", err)
+		return cfg, fmt.Errorf("error parsing YAML: %w", err)
 	}
 
 	// TODO: Validate more variables

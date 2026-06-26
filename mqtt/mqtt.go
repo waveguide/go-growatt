@@ -58,8 +58,25 @@ func (m *Mqtt) Init() error {
 func (m *Mqtt) Publish(topic string, payload string, retain bool) {
 	token := m.client.Publish(topic, 0, retain, payload)
 	token.Wait()
+	if err := token.Error(); err != nil {
+		slog.Error(fmt.Sprintf("Failed to publish to topic %q: %v", topic, err))
+	} else {
+		slog.Debug(fmt.Sprintf("Published to topic %q: %s", topic, payload))
+	}
+}
 
-	slog.Debug(fmt.Sprintf("Published message to topic %q: %s", topic, payload))
+func (m *Mqtt) Subscribe(topic string, handler func(payload string)) error {
+	token := m.client.Subscribe(topic, 1, func(_ MQTT.Client, msg MQTT.Message) {
+		handler(string(msg.Payload()))
+	})
+	token.Wait()
+	if err := token.Error(); err != nil {
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Subscribed to topic %q", topic))
+
+	return nil
 }
 
 func (m *Mqtt) Disconnect() {

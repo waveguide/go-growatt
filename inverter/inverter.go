@@ -2,6 +2,7 @@ package inverter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -56,12 +57,12 @@ type Inverter struct {
 	client   *modbus.ModbusClient
 }
 
-func (i *Inverter) Connect() error {
+func (i *Inverter) connect() error {
 	slog.Info("Connecting to inverter")
 
 	// Create and configure client
 	c, err := modbus.NewClient(&modbus.ClientConfiguration{
-		URL:      fmt.Sprintf("rtu://%s", i.Address),
+		URL:      i.Address,
 		Speed:    uint(i.BaudRate),
 		DataBits: 8,
 		Parity:   modbus.PARITY_NONE,
@@ -86,11 +87,23 @@ func (i *Inverter) Connect() error {
 	return nil
 }
 
-func (i *Inverter) Disconnect() error {
+func (i *Inverter) disconnect() error {
 	return i.client.Close()
 }
 
-func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
+func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan uint16) error {
+	// Open the connection (retrying until the inverter is reachable or the
+	// context is cancelled) and ensure it is closed when Run returns.
+	if err := i.connectWithRetry(ctx); err != nil {
+		return err
+	}
+	defer i.disconnect()
+
+	// Upon start always check (and set when needed) the time on the inverter.
+	if err := i.checkSetTime(); err != nil {
+		slog.Warn(fmt.Sprintf("Failed to CheckSetTime on inverter upon start: %v", err))
+	}
+
 	// Set last known state to 'waiting' upon start reading. This is
 	// the state of the inverter when it is turned off and the
 	// registers cannot be read. Start with this state when it is not
@@ -100,7 +113,7 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 	var IsTimeoutError bool
 	timeoutCnt := 0
 
-	slog.Info("Start reading from inverter")
+	slog.Info("Start inverter handling")
 
 	statsTicker := time.NewTicker(2 * time.Second)
 	defer statsTicker.Stop()
@@ -112,7 +125,7 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 		case <-statsTicker.C:
 			stats, err := i.getStats()
 			if err != nil {
-				if err.Error() == "request timed out" {
+				if errors.Is(err, modbus.ErrRequestTimedOut) {
 					IsTimeoutError = true
 				} else {
 					IsTimeoutError = false
@@ -126,7 +139,11 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 							err,
 						),
 					)
-					time.Sleep(1 * time.Minute)
+					select {
+					case <-time.After(1 * time.Minute):
+					case <-ctx.Done():
+						return i.stop(ctx)
+					}
 				} else {
 					slog.Warn(fmt.Sprintf("Got error while retrieving modbus registers: %v", err))
 					if IsTimeoutError {
@@ -134,38 +151,79 @@ func (i *Inverter) Read(ctx context.Context, ch chan<- Stats) error {
 
 						if timeoutCnt >= 10 {
 							slog.Warn(fmt.Sprintf("Got %d subsequent read timeouts. Reconnect to inverter.", timeoutCnt))
-							i.Disconnect()
-							i.Connect()
+							if err := i.reconnect(ctx); err != nil {
+								return err // ctx cancelled during reconnect
+							}
+							timeoutCnt = 0
 						}
 					}
 				}
 				continue
 			}
-			ch <- stats
+			select {
+			case ch <- stats:
+			case <-ctx.Done():
+				return i.stop(ctx)
+			}
 			lastInverterState = stats.State
 			timeoutCnt = 0
 
 		case <-checkTimeTicker.C:
 			// Only try to check and set time when inverter is in 'normal' state
 			if lastInverterState == InverterStateCodes[1] {
-				if err := i.CheckSetTime(); err != nil {
+				if err := i.checkSetTime(); err != nil {
 					slog.Error(fmt.Sprintf("CheckSetTime on inverter failed: %v", err))
 					continue
 				}
 			}
 
+		case rate := <-powerRate:
+			// Handled here (not in the MQTT callback) so all modbus client
+			// access stays in this single goroutine, avoiding a data race on
+			// i.client.
+			if err := i.setActivePowerRate(rate); err != nil {
+				slog.Error(fmt.Sprintf("Failed to set active power rate to %d: %v", rate, err))
+			}
+
 		case <-ctx.Done():
-			slog.Info("Context canceled, stop reading from inverter")
-			i.Disconnect()
+			return i.stop(ctx)
+		}
+	}
+}
+
+// reconnect closes the current connection and re-establishes it. Used after
+// repeated read timeouts.
+func (i *Inverter) reconnect(ctx context.Context) error {
+	i.disconnect()
+	return i.connectWithRetry(ctx)
+}
+
+// connectWithRetry connects to the inverter, retrying every 10s until it
+// succeeds or the context is cancelled (in which case it returns ctx.Err()).
+func (i *Inverter) connectWithRetry(ctx context.Context) error {
+	for {
+		if err := i.connect(); err == nil {
+			return nil
+		}
+
+		slog.Warn("Connect to inverter failed, retrying in 10s")
+		select {
+		case <-time.After(10 * time.Second):
+		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 }
 
+func (i *Inverter) stop(ctx context.Context) error {
+	slog.Info("Context canceled, stop inverter handling")
+	return ctx.Err()
+}
+
 func (i *Inverter) getStats() (Stats, error) {
 	data, err := i.client.ReadRegisters(0, 41, modbus.INPUT_REGISTER)
 	if err != nil {
-		return Stats{}, err
+		return Stats{}, fmt.Errorf("failed to read registers 0-41: %w", err)
 	}
 
 	stats := Stats{
@@ -174,7 +232,7 @@ func (i *Inverter) getStats() (Stats, error) {
 		PVInputPower:      (uint32(data[1])<<16 | uint32(data[2])) / 10,
 		PV1InputVolt:      data[3] / 10,
 		PV1InputCurrent:   data[4] / 10,
-		PV1InputWatt:      (uint32(data[5])<<16 | uint32(data[5])) / 10,
+		PV1InputWatt:      (uint32(data[5])<<16 | uint32(data[6])) / 10,
 		PV2InputVolt:      data[7] / 10,
 		PV2InputCurrent:   data[8] / 10,
 		PV2InputWatt:      (uint32(data[9])<<16 | uint32(data[10])) / 10,
@@ -199,8 +257,8 @@ func (i *Inverter) getStats() (Stats, error) {
 	return stats, nil
 }
 
-func (i *Inverter) CheckSetTime() error {
-	inverterTime, err := i.GetTime()
+func (i *Inverter) checkSetTime() error {
+	inverterTime, err := i.getTime()
 	if err != nil {
 		return err
 	}
@@ -314,7 +372,7 @@ func (i *Inverter) setTime(inverterTime time.Time, newTime time.Time) error {
 	return nil
 }
 
-func (i *Inverter) GetTime() (time.Time, error) {
+func (i *Inverter) getTime() (time.Time, error) {
 	data, err := i.client.ReadRegisters(45, 6, modbus.HOLDING_REGISTER)
 	if err != nil {
 		slog.Error(err.Error())
@@ -335,4 +393,23 @@ func (i *Inverter) GetTime() (time.Time, error) {
 	slog.Debug(fmt.Sprintf("Current time on inverter is %v", t))
 
 	return t, nil
+}
+
+// setActivePowerRate can be used to limit the maximum AC output of the inverter.
+// This is a percentage of the maximum output that the inverter can deliver.
+// E.g. when the maximum AC output of the inverter is 3600W:
+// 100%: 3600W
+// 50%:  1800W
+// 0%:   0W
+func (i *Inverter) setActivePowerRate(percentage uint16) error {
+	slog.Info(fmt.Sprintf("Change output power percentage to %d", percentage))
+
+	if err := i.client.WriteRegister(3, percentage); err != nil {
+		return fmt.Errorf(
+			"failed to set active power percentage(%d): %w",
+			percentage, err,
+		)
+	}
+
+	return nil
 }
