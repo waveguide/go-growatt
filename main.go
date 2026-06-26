@@ -75,8 +75,8 @@ func main() {
 
 	cmdTopic := fmt.Sprintf("%s/powerrate/set", cfg.Mqtt.Topic)
 	if err := mqttClient.Subscribe(cmdTopic, func(payload string) {
-		rate, err := strconv.Atoi(strings.TrimSpace(payload))
-		if err != nil || rate < 0 || rate > 100 {
+		rate, ok := parsePowerRate(payload)
+		if !ok {
 			slog.Warn(fmt.Sprintf("Ignoring invalid power rate command %q on %s", payload, cmdTopic))
 			return
 		}
@@ -86,7 +86,7 @@ func main() {
 		case <-powerRateChan: // if a value is buffered, remove it
 		default:
 		}
-		powerRateChan <- uint16(rate)
+		powerRateChan <- rate
 	}); err != nil {
 		log.Fatal("Failed to subscribe to power rate command topic")
 	}
@@ -172,6 +172,17 @@ func main() {
 			return
 		}
 	}
+}
+
+// parsePowerRate parses an MQTT power-rate command payload into a 0-100
+// percentage. ok is false when the payload is not a valid percentage.
+func parsePowerRate(payload string) (uint16, bool) {
+	rate, err := strconv.Atoi(strings.TrimSpace(payload))
+	if err != nil || rate < 0 || rate > 100 {
+		return 0, false
+	}
+
+	return uint16(rate), true
 }
 
 func readConfig(configPath string) (config, error) {

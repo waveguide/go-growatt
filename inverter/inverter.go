@@ -226,8 +226,14 @@ func (i *Inverter) getStats() (Stats, error) {
 		return Stats{}, fmt.Errorf("failed to read registers 0-41: %w", err)
 	}
 
+	return parseStats(data, time.Now().UTC().Format("2006-01-02 15:04:05")), nil
+}
+
+// parseStats decodes a block of 41 input registers (starting at register 0)
+// into a Stats struct. timestamp is the value used for the Timestamp field.
+func parseStats(data []uint16, timestamp string) Stats {
 	stats := Stats{
-		Timestamp:         time.Now().UTC().Format("2006-01-02 15:04:05"),
+		Timestamp:         timestamp,
 		State:             InverterStateCodes[data[0]],
 		PVInputPower:      (uint32(data[1])<<16 | uint32(data[2])) / 10,
 		PV1InputVolt:      data[3] / 10,
@@ -254,7 +260,7 @@ func (i *Inverter) getStats() (Stats, error) {
 		FaultCode:         data[40],
 	}
 
-	return stats, nil
+	return stats
 }
 
 func (i *Inverter) checkSetTime() error {
