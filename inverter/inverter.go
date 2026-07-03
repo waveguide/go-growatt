@@ -117,6 +117,16 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 		slog.Warn(fmt.Sprintf("Failed to disable PF CMD memory on inverter upon start: %v", err))
 	}
 
+	// Seed the active power rate from the inverter once. After this we track the
+	// value we command rather than re-reading it (see getStats). Fall back to
+	// the documented default of 100% if the inverter can't be read yet.
+	i.activePowerRate = 100
+	if rate, err := i.getActivePowerRate(); err != nil {
+		slog.Warn(fmt.Sprintf("Failed to read initial active power rate: %v", err))
+	} else {
+		i.activePowerRate = rate
+	}
+
 	// Upon start always check (and set when needed) the time on the inverter.
 	if err := i.checkSetTime(); err != nil {
 		slog.Warn(fmt.Sprintf("Failed to CheckSetTime on inverter upon start: %v", err))
@@ -128,8 +138,7 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 	// known yet.
 	lastInverterState := InverterStateCodes[0]
 
-	var IsTimeoutError bool
-	timeoutCnt := 0
+	errCnt := 0
 
 	slog.Info("Start inverter handling")
 
@@ -143,13 +152,9 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 		case <-statsTicker.C:
 			stats, err := i.getStats()
 			if err != nil {
-				if errors.Is(err, modbus.ErrRequestTimedOut) {
-					IsTimeoutError = true
-				} else {
-					IsTimeoutError = false
-				}
+				isTimeout := errors.Is(err, modbus.ErrRequestTimedOut)
 
-				if lastInverterState == InverterStateCodes[0] && IsTimeoutError {
+				if lastInverterState == InverterStateCodes[0] && isTimeout {
 					// Inverter is in 'waiting state' and modbus registers
 					// can only be read when the status is changed to 'normal'.
 					slog.Debug(
@@ -162,19 +167,22 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 					case <-ctx.Done():
 						return i.stop(ctx)
 					}
-				} else {
-					slog.Warn(fmt.Sprintf("Got error while retrieving modbus registers: %v", err))
-					if IsTimeoutError {
-						timeoutCnt += 1
+					continue
+				}
 
-						if timeoutCnt >= 10 {
-							slog.Warn(fmt.Sprintf("Got %d subsequent read timeouts. Reconnect to inverter.", timeoutCnt))
-							if err := i.reconnect(ctx); err != nil {
-								return err // ctx cancelled during reconnect
-							}
-							timeoutCnt = 0
-						}
+				slog.Warn(fmt.Sprintf("Got error while retrieving modbus registers: %v", err))
+
+				// A timeout can be a transient glitch, so allow a few before
+				// reconnecting. Any other error (e.g. a 'broken pipe' when the
+				// connection is dropped) means the connection is gone, so
+				// reconnect right away.
+				errCnt++
+				if !isTimeout || errCnt >= 10 {
+					slog.Warn(fmt.Sprintf("Reconnecting to inverter after %d error(s)", errCnt))
+					if err := i.reconnect(ctx); err != nil {
+						return err // ctx cancelled during reconnect
 					}
+					errCnt = 0
 				}
 				continue
 			}
@@ -184,7 +192,7 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 				return i.stop(ctx)
 			}
 			lastInverterState = stats.State
-			timeoutCnt = 0
+			errCnt = 0
 
 		case <-checkTimeTicker.C:
 			// Only try to check and set time when inverter is in 'normal' state
@@ -206,7 +214,7 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 			// never persist to non-volatile memory.
 			if !i.cmdMemoryDisabled {
 				if err := i.ensureCmdMemoryDisabled(); err != nil {
-					slog.Error(fmt.Sprintf("Skipping power rate change: could not disable PF CMD memory: %v", err))
+					slog.Error(fmt.Sprintf("Refusing power rate change: could not disable PF CMD memory: %v", err))
 					continue
 				}
 			}
@@ -258,14 +266,11 @@ func (i *Inverter) getStats() (Stats, error) {
 
 	stats := parseStats(data, time.Now().UTC().Format("2006-01-02 15:04:05"))
 
-	// Read the configured power rate (holding register 3) and include it. On a
-	// transient failure keep the last known value rather than failing the whole
-	// stats read.
-	if rate, err := i.getActivePowerRate(); err != nil {
-		slog.Warn(fmt.Sprintf("Failed to read active power rate: %v", err))
-	} else {
-		i.activePowerRate = rate
-	}
+	// Report the last known active power rate. We can't re-read register 3 here:
+	// with PF CMD memory disabled (register 2 = 0) a write to register 3 takes
+	// effect in RAM but the register read still returns the persisted value, so
+	// reading it back would wrongly report 100. Instead the cache is seeded once
+	// at startup and updated whenever we set the rate.
 	stats.ActivePowerRate = i.activePowerRate
 
 	return stats, nil
@@ -492,6 +497,8 @@ func (i *Inverter) ensureCmdMemoryDisabled() error {
 		if err := i.client.WriteRegister(2, 0); err != nil {
 			return fmt.Errorf("failed to disable PF CMD memory state: %w", err)
 		}
+	} else {
+		slog.Info("PF CMD memory state is disabled; This is good and avoids flash wear.")
 	}
 
 	i.cmdMemoryDisabled = true
