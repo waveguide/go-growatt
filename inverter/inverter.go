@@ -60,6 +60,12 @@ type Inverter struct {
 	// activePowerRate caches the last known active power rate (holding
 	// register 3) so a transient read failure doesn't drop it from the stats.
 	activePowerRate uint16
+
+	// cmdMemoryDisabled is true once we've confirmed holding register 2
+	// ("PF CMD memory state") is 0, meaning writes to the power control
+	// registers (3, 4, 5, 99) are kept in RAM instead of persisted to the
+	// inverter's non-volatile memory on every write.
+	cmdMemoryDisabled bool
 }
 
 func (i *Inverter) connect() error {
@@ -103,6 +109,13 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 		return err
 	}
 	defer i.disconnect()
+
+	// Upon start make sure the inverter keeps power-control writes in RAM
+	// rather than persisting them, to avoid wearing out its non-volatile
+	// memory when the active power rate is changed frequently.
+	if err := i.ensureCmdMemoryDisabled(); err != nil {
+		slog.Warn(fmt.Sprintf("Failed to disable PF CMD memory on inverter upon start: %v", err))
+	}
 
 	// Upon start always check (and set when needed) the time on the inverter.
 	if err := i.checkSetTime(); err != nil {
@@ -186,6 +199,18 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 			// Handled here (not in the MQTT callback) so all modbus client
 			// access stays in this single goroutine, avoiding a data race on
 			// i.client.
+
+			// Make sure writes stay in RAM before touching the power rate. If
+			// the startup attempt failed (e.g. inverter was in 'waiting' state)
+			// retry now, and skip the write if we still can't confirm it, so we
+			// never persist to non-volatile memory.
+			if !i.cmdMemoryDisabled {
+				if err := i.ensureCmdMemoryDisabled(); err != nil {
+					slog.Error(fmt.Sprintf("Skipping power rate change: could not disable PF CMD memory: %v", err))
+					continue
+				}
+			}
+
 			if err := i.setActivePowerRate(rate); err != nil {
 				slog.Error(fmt.Sprintf("Failed to set active power rate to %d: %v", rate, err))
 			}
@@ -448,4 +473,28 @@ func (i *Inverter) getActivePowerRate() (uint16, error) {
 	}
 
 	return data[0], nil
+}
+
+// ensureCmdMemoryDisabled makes sure holding register 2 ("PF CMD memory state")
+// is 0. When it is 1 the inverter persists every write to the power control
+// registers (3 Active P Rate, 4 Reactive P Rate, 5 Power factor, 99) to its
+// non-volatile memory, which wears it out. With it set to 0 those writes are
+// kept in RAM only, so frequently changing the active power rate is safe. The
+// value survives across reads, so once confirmed we don't touch it again.
+func (i *Inverter) ensureCmdMemoryDisabled() error {
+	data, err := i.client.ReadRegisters(2, 1, modbus.HOLDING_REGISTER)
+	if err != nil {
+		return fmt.Errorf("failed to read PF CMD memory state: %w", err)
+	}
+
+	if data[0] != 0 {
+		slog.Info("PF CMD memory state is enabled; disabling it so power control writes stay in RAM")
+		if err := i.client.WriteRegister(2, 0); err != nil {
+			return fmt.Errorf("failed to disable PF CMD memory state: %w", err)
+		}
+	}
+
+	i.cmdMemoryDisabled = true
+
+	return nil
 }
