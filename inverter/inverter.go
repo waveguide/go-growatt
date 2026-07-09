@@ -172,12 +172,15 @@ func (i *Inverter) Run(ctx context.Context, ch chan<- Stats, powerRate <-chan ui
 
 				slog.Warn(fmt.Sprintf("Got error while retrieving modbus registers: %v", err))
 
-				// A timeout can be a transient glitch, so allow a few before
-				// reconnecting. Any other error (e.g. a 'broken pipe' when the
-				// connection is dropped) means the connection is gone, so
-				// reconnect right away.
+				// Transient read errors (a timeout, or a corrupted/partial
+				// frame: bad crc, short frame, protocol error) leave the
+				// connection up: the modbus library flushes and re-syncs the
+				// link on its own, so the next poll usually succeeds. Tolerate a
+				// run of them before forcing a reconnect. Only a genuine
+				// connection loss (e.g. a 'broken pipe', which surfaces as a
+				// different error) reconnects right away.
 				errCnt++
-				if !isTimeout || errCnt >= 10 {
+				if !isTransientReadError(err) || errCnt >= 10 {
 					slog.Warn(fmt.Sprintf("Reconnecting to inverter after %d error(s)", errCnt))
 					if err := i.reconnect(ctx); err != nil {
 						return err // ctx cancelled during reconnect
@@ -256,6 +259,18 @@ func (i *Inverter) connectWithRetry(ctx context.Context) error {
 func (i *Inverter) stop(ctx context.Context) error {
 	slog.Info("Context canceled, stop inverter handling")
 	return ctx.Err()
+}
+
+// isTransientReadError reports whether err is a recoverable, connection-alive
+// read failure: a timeout, or a corrupted/partial frame (bad crc, short frame,
+// protocol error) that the modbus library re-syncs from on the next poll.
+// Genuine connection-loss errors (e.g. a broken pipe) are not transient and
+// warrant an immediate reconnect.
+func isTransientReadError(err error) bool {
+	return errors.Is(err, modbus.ErrRequestTimedOut) ||
+		errors.Is(err, modbus.ErrBadCRC) ||
+		errors.Is(err, modbus.ErrShortFrame) ||
+		errors.Is(err, modbus.ErrProtocolError)
 }
 
 func (i *Inverter) getStats() (Stats, error) {
